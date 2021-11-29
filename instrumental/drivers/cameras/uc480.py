@@ -12,6 +12,7 @@ import weakref
 import fnmatch
 import numpy as np
 import win32event  # req: pywin32
+import array
 
 from nicelib import (NiceLib, NiceObject, load_lib,
                      RetHandler, Sig, ret_return)  # req: nicelib >= 0.5
@@ -323,6 +324,33 @@ class NiceUC480(NiceLib):
             if getting:
                 return param_data[0] if deref else param_data
 
+        @Sig('in', 'in', 'inout', 'in')
+        def IO(self, command, param=None):
+            if command in IO_GET_PARAM_TYPES:
+                param_type = IO_GET_PARAM_TYPES[command]
+                getting = True
+            elif command in IO_SET_PARAM_TYPES:
+                param_type = IO_SET_PARAM_TYPES[command]
+                getting = False
+            else:
+                raise Error("Unsupported command given")
+
+            # if getting and param is not None:
+            #     raise ValueError("Cannot give a param value when using a GET command")
+            # elif not getting and param is None:
+            #     raise ValueError("Must give a param value when using a SET command")
+
+            param_type = ffi.typeof(param_type)
+            deref = (param_type.kind == 'pointer')  # Don't dereference arrays
+
+            param_data = ffi.new(param_type, param)
+            size = ffi.sizeof(ffi.typeof(param_data).item if deref else param_data)
+            param_ptr = ffi.cast('void*', param_data)
+            self._autofunc_IO(command, param_ptr, size)
+
+            if getting:
+                return param_data[0] if deref else param_data
+
 
 lib = NiceUC480
 
@@ -330,6 +358,11 @@ lib = NiceUC480
 if not hasattr(lib, 'AOI_IMAGE_GET_POS_FAST_SUPPORTED'):
     lib.AOI_IMAGE_GET_POS_FAST_SUPPORTED = lib.AOI_IMAGE_SET_POS_FAST_SUPPORTED
 
+# # set the missing flash constants
+# lib.IO_FLASH_MODE_GPIO_1 = 16
+# lib.IO_FLASH_MODE_GPIO_2 = 32
+
+# set the datatypes for the hand-defined functions
 AOI_GET_PARAM_TYPES = {
     lib.AOI_IMAGE_GET_AOI: 'IS_RECT*',
     lib.AOI_IMAGE_GET_POS: 'IS_POINT_2D*',
@@ -415,6 +448,28 @@ EXPOSURE_GET_PARAM_TYPES = {
 EXPOSURE_SET_PARAM_TYPES = {
     lib.IS_EXPOSURE_CMD_SET_EXPOSURE: 'double*',
     lib.IS_EXPOSURE_CMD_SET_LONG_EXPOSURE_ENABLE: 'UINT*',
+}
+
+IO_GET_PARAM_TYPES = {
+    lib.IS_IO_CMD_FLASH_GET_SUPPORTED_GPIOS: 'UINT*',
+    lib.IS_IO_CMD_FLASH_GET_MODE: 'UINT*',
+    lib.IS_IO_CMD_FLASH_GET_PARAMS: 'IO_FLASH_PARAMS*',
+    lib.IS_IO_CMD_FLASH_GET_PARAMS_MIN: 'IO_FLASH_PARAMS*',
+    lib.IS_IO_CMD_FLASH_GET_PARAMS_MAX: 'IO_FLASH_PARAMS*',
+    lib.IS_IO_CMD_FLASH_GET_PARAMS_INC: 'IO_FLASH_PARAMS*',
+    lib.IS_IO_CMD_GPIOS_GET_DIRECTION: 'UINT*',
+    lib.IS_IO_CMD_GPIOS_GET_STATE: 'UINT*',
+    lib.IS_IO_CMD_GPIOS_GET_CONFIGURATION: 'IO_GPIO_CONFIGURATION*',
+    lib.IS_IO_CMD_FLASH_GET_GLOBAL_PARAMS: 'IO_FLASH_PARAMS*',
+}
+
+IO_SET_PARAM_TYPES = {
+    lib.IS_IO_CMD_FLASH_SET_MODE: 'UINT*',
+    lib.IS_IO_CMD_FLASH_SET_PARAMS: 'IO_FLASH_PARAMS*',
+    lib.IS_IO_CMD_GPIOS_SET_DIRECTION: 'UINT*',
+    lib.IS_IO_CMD_GPIOS_SET_STATE: 'UINT*',
+    lib.IS_IO_CMD_GPIOS_SET_CONFIGURATION: 'IO_GPIO_CONFIGURATION*',
+    lib.IS_IO_CMD_FLASH_APPLY_GLOBAL_PARAMS: 'IO_FLASH_PARAMS*',
 }
 
 SUBSAMP_V_CODE_FROM_NUM = {
@@ -954,6 +1009,225 @@ class UC480_Camera(Camera):
             lib.CM_MONO16: 'mono16',
         }
         return MAP.get(self._color_mode)
+
+    def get_flash_mode(self):
+        """Get the current flash mode and respective port"""
+
+        flash_ports = []
+        # get the raw mode
+        raw_mode = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_MODE)
+
+        # check which port is active
+        if (raw_mode & lib.IO_FLASH_MODE_GPIO_1) > 0:
+            flash_ports.append('GPIO1')
+        if (raw_mode & lib.IO_FLASH_MODE_GPIO_2) > 0:
+            flash_ports.append('GPIO2')
+
+        # get the number of just the mode (go through binary)
+        only_mode = int(bin(raw_mode)[-3:], 2)
+        # check the mode
+        if only_mode == lib.IO_FLASH_MODE_OFF:
+            flash_mode = 'off'
+        elif only_mode == lib.IO_FLASH_MODE_TRIGGER_LO_ACTIVE:
+            flash_mode = 'trigger_low'
+        elif only_mode == lib.IO_FLASH_MODE_TRIGGER_HI_ACTIVE:
+            flash_mode = 'trigger_high'
+        elif only_mode == lib.IO_FLASH_MODE_CONSTANT_LOW:
+            flash_mode = 'constant_low'
+        elif only_mode == lib.IO_FLASH_MODE_CONSTANT_HIGH:
+            flash_mode = 'constant_high'
+        elif only_mode == lib.IO_FLASH_MODE_FREERUN_LO_ACTIVE:
+            flash_mode = 'freerun_low'
+        else:  # only_mode == lib.IO_FLASH_MODE_FREERUN_HI_ACTIVE:
+            flash_mode = 'freerun_high'
+
+        return flash_ports, flash_mode
+
+    def set_flash_mode(self, port, mode):
+        """Set the flash mode for the target port"""
+        # get the mode ID
+        if mode == 'off':
+            target_mode = lib.IO_FLASH_MODE_OFF
+        elif mode == 'trigger_low':
+            target_mode = lib.IO_FLASH_MODE_TRIGGER_LO_ACTIVE
+        elif mode == 'trigger_high':
+            target_mode = lib.IO_FLASH_MODE_TRIGGER_HI_ACTIVE
+        elif mode == 'constant_low':
+            target_mode = lib.IO_FLASH_MODE_CONSTANT_LOW
+        elif mode == 'constant_high':
+            target_mode = lib.IO_FLASH_MODE_CONSTANT_HIGH
+        elif mode == 'freerun_low':
+            target_mode = lib.IO_FLASH_MODE_FREERUN_LO_ACTIVE
+        elif mode == 'freerun_high':
+            target_mode = lib.IO_FLASH_MODE_FREERUN_HI_ACTIVE
+        else:
+            raise Error("Unrecognized flash mode {}".format(mode))
+
+        # get the port
+        if port == 1:
+            target_port = lib.IO_FLASH_MODE_GPIO_1
+        elif port == 2:
+            target_port = lib.IO_FLASH_MODE_GPIO_2
+        else:
+            raise Error("Unrecognized flash port {}".format(port))
+
+        # assemble the final command
+        command = target_mode | target_port
+        self._dev.IO(lib.IS_IO_CMD_FLASH_SET_MODE, command)
+
+    def get_supported_flash_gpios(self):
+        """Get which GPIOs can be used for flash"""
+
+        supported_gpios = []
+        # get the IDs from the supported GPIOs as a single int
+        ports_raw = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_SUPPORTED_GPIOS)
+        # determine which ports are on
+        if (ports_raw & lib.IO_FLASH_MODE_GPIO_1) > 0:
+            supported_gpios.append('GPIO_1')
+        if (ports_raw & lib.IO_FLASH_MODE_GPIO_2) > 0:
+            supported_gpios.append('GPIO_2')
+        return supported_gpios
+
+    def get_gpio_direction(self):
+        """Get whether each GPIO is set to input or output"""
+        # get the raw direction
+        raw_direction = self._dev.IO(lib.IS_IO_CMD_GPIOS_GET_DIRECTION)
+        # parse each port
+        if (raw_direction & lib.IO_GPIO_1) > 0:
+            gpio1 = 'out'
+        else:
+            gpio1 = 'in'
+
+        if (raw_direction & lib.IO_GPIO_2) > 0:
+            gpio2 = 'out'
+        else:
+            gpio2 = 'in'
+
+        return gpio1, gpio2
+
+    def set_gpio_direction(self, gpio1='in', gpio2='in'):
+        """Set the input or output status of the GPIO ports, default is in"""
+        command = 0
+        if gpio1 == 'out':
+            command = command | lib.IO_GPIO_1
+        elif gpio1 == 'in':
+            # redundant but forces proper specification of direction
+            command = command
+        else:
+            raise Error("Unrecognized GPIO1 direction {}".format(gpio1))
+
+        if gpio2 == 'out':
+            command = command | lib.IO_GPIO_2
+        elif gpio2 == 'in':
+            command = command
+        else:
+            raise Error("Unrecognized GPIO2 direction {}".format(gpio2))
+
+        self._dev.IO(lib.IS_IO_CMD_GPIOS_SET_DIRECTION, command)
+
+    def get_gpio_state(self):
+        """Get the state of the GPIO ports"""
+
+        # get the raw state
+        raw_state = self._dev.IO(lib.IS_IO_CMD_GPIOS_GET_STATE)
+        # parse for each port
+        if (raw_state & lib.IO_GPIO_1) > 0:
+            gpio1 = 'high'
+        else:
+            gpio1 = 'low'
+
+        if (raw_state & lib.IO_GPIO_2) > 0:
+            gpio2 = 'high'
+        else:
+            gpio2 = 'low'
+
+        return gpio1, gpio2
+
+    def set_gpio_state(self, state1='low', state2='low'):
+        """Set the state of the GPIO ports, default is low"""
+
+        # initialize the command
+        command = 0
+        # parse the inputs
+        if state1 == 'high':
+            command = command | lib.IO_GPIO_1
+        elif state1 == 'low':
+            command = command
+        else:
+            raise Error("Unrecognized GPIO1 state {}".format(state1))
+
+        if state2 == 'high':
+            command = command | lib.IO_GPIO_2
+        elif state2 == 'low':
+            command = command
+        else:
+            raise Error("Unrecognized GPIO2 state {}".format(state2))
+
+        self._dev.IO(lib.IS_IO_CMD_GPIOS_SET_STATE, command)
+
+    def get_flash_params(self):
+        """Get the flash parameters"""
+        flash_params = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_PARAMS)
+        return flash_params.s32Delay, flash_params.u32Duration
+
+    def set_flash_params(self, delay=10, duration=10):
+        """Set the flash parameters"""
+        self._dev.IO(lib.IS_IO_CMD_FLASH_SET_PARAMS, (delay, duration))
+
+    def get_flash_min_params(self):
+        """Get the minimum accepted flash parameters"""
+        flash_params = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_PARAMS_MIN)
+        return flash_params.s32Delay, flash_params.u32Duration
+
+    def get_flash_max_params(self):
+        """Get the maximum accepted flash parameters"""
+        flash_params = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_PARAMS_MAX)
+        return flash_params.s32Delay, flash_params.u32Duration
+
+    def get_flash_inc_params(self):
+        """Get the minimum accepted flash parameter increment"""
+        flash_params = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_PARAMS_INC)
+        return flash_params.s32Delay, flash_params.u32Duration
+
+    # def get_gpio_config(self, port):
+    #     """Get the configuration of the selected GPIO"""
+    #     ignore = lib.IGNORE_PARAMETER
+    #     ignore_array = [ignore]*12
+    #     if port == 'GPIO_1':
+    #         target_gpio = lib.IO_GPIO_1
+    #     elif port == 'GPIO_2':
+    #         target_gpio = lib.IO_GPIO_1
+    #     elif port == 'FLASH_GPIO_1':
+    #         target_gpio = lib.IO_GPIO_1
+    #     elif port == 'FLASH_GPIO_2':
+    #         target_gpio = lib.IO_GPIO_1
+    #     else:
+    #         raise Error("Unrecognized GPIO port {}".format(port))
+    #
+    #     target_gpio = (target_gpio, ignore, ignore, ignore, ignore_array)
+    #     gpio_params = self._dev.IO(lib.IS_IO_CMD_GPIOS_GET_CONFIGURATION, target_gpio)
+    #     return (gpio_params.u32Gpio, gpio_params.u32Caps,
+    #             gpio_params.u32Configuration, gpio_params.u32State)
+    #
+    # def set_gpio_config(self, gpio, caps, config, state):
+    #     ignore2 = lib.IGNORE_PARAMETER
+    #     ignore = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    #     # gpio = lib.IO_GPIO_1
+    #     # caps = ignore2
+    #     # config = lib.IS_GPIO_FLASH
+    #     # state = ignore2
+    #     config_tuple = (gpio, caps, config, state, ignore)
+    #     self._dev.IO(lib.IS_IO_CMD_GPIOS_SET_CONFIGURATION, config_tuple)
+
+    def get_flash_global_params(self):
+        """Get the parameters for the global exposure window"""
+        flash_params = self._dev.IO(lib.IS_IO_CMD_FLASH_GET_GLOBAL_PARAMS)
+        return flash_params.s32Delay, flash_params.u32Duration
+
+    def set_flash_global_params(self, delay, duration):
+        """Get the parameters for the global exposure window
+        and set them as flash parameters"""
+        self._dev.IO(lib.IS_IO_CMD_FLASH_SET_PARAMS, (delay, duration))
 
     def set_trigger(self, mode='software', edge='rising'):
         """Set the camera trigger mode.

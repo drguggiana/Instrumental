@@ -20,3 +20,5 @@ Release/
 errortext.c
 errortext.pyd
 errortext.*.pyd
+
+.idea/
