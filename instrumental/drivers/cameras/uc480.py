@@ -1229,6 +1229,10 @@ class UC480_Camera(Camera):
         and set them as flash parameters"""
         self._dev.IO(lib.IS_IO_CMD_FLASH_SET_PARAMS, (delay, duration))
 
+    def set_framerate(self, framerate):
+        """Define the framerate"""
+        self._dev.SetFrameRate(framerate)
+
     def set_trigger(self, mode='software', edge='rising'):
         """Set the camera trigger mode.
 
